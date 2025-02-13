@@ -14,17 +14,16 @@
 #include <string.h>
 #include <time.h>
 
+// Alias for struct
 typedef struct stat stat_t;
 
-#define BUF_SIZE 50000
+// Buffer and mode definitions
+#define BUF_SIZE 8192           // Buffer size for reading/writing files
+#define DATE_BUF_SIZE 20        // Buffer size for date string formatting
+#define DEFAULT_MODE 0664       // Default permissions (rw-rw-r--)
+#define DETERMINISTIC_MODE 0644 // Deterministic mode permissions (rw-r--r--)
 
-#ifndef FALSE
-# define FALSE 0
-#endif // FALSE
-#ifndef TRUE
-# define TRUE 1
-#endif // TRUE
-
+// Define ON/OFF constants
 #ifndef OFF 
 # define OFF 0
 #endif // OFF 
@@ -32,24 +31,24 @@ typedef struct stat stat_t;
 # define ON 1
 #endif // ON 
 
-void showHelp(void);
-void printTOC(int, int);
-void getPermString(mode_t, char*);
-void writeFileToArchive(int, int, int, const char*);
-void extractArchive(int, int);            
+// Function prototypes
+void show_help(void);
+void print_toc(int, int);
+void get_perm_string(mode_t, char*);
+void write_to_archive(int, int, int, const char*);
+void extract_archive(int, int);            
 
 int main(int argc, char* argv[]){
-    int opt = -1;
-    var_action_t action = ACTION_NONE;
-    char* fileName = NULL;   // -f filename
-    int verboseFlag = OFF;   // -v 
-    int determFlag = OFF;    // -D & -U
+    int opt = -1;             // Option for getopt()
+    var_action_t action = ACTION_NONE;  // Selected archive action
+    char* file_name = NULL;   // -f filename
+    int verbose_mode = OFF;   // -v verbose output flag 
+    int determ_mode = OFF;    // -D deterministic mode flag
+    int archive_fd = -1;      // Archive file descriptor
+    int member_fd = -1;       // Member file descriptor
+    char buffer[SARMAG];      // Buffer for reading archive tag (ARMAG)
 
-    int fd = -1; // file descriptor
-    char buffer[BUF_SIZE]; // Buffer for reading ARMAG
-    int isValid = 0; //Flag for ARMAG validation
-    int member_fd = -1; // File descriptor for member files
-
+    // Process command line options using getopt
     while ((opt = getopt(argc, argv, ARVIK_OPTIONS)) != -1){
         switch(opt){
             case 'x':
@@ -62,113 +61,104 @@ int main(int argc, char* argv[]){
                 action = ACTION_TOC;
                 break;
             case 'f':
-                fileName = optarg;
+                file_name = optarg;
                 break;
             case 'h':
-                showHelp();
+                show_help();
                 exit(EXIT_SUCCESS);
                 break;
             case 'v':
-                verboseFlag = ON;
+                verbose_mode = ON;
                 break;
             case 'D':
-                determFlag = ON; 
+                determ_mode = ON; 
                 break;
             case 'U':
-                determFlag = OFF;
+                determ_mode = OFF;
                 break;
             default:
                 fprintf(stderr, "Usage: %s %s\n", argv[0], ARVIK_OPTIONS);
                 exit(INVALID_CMD_OPTION);
         }
     }
-
-    // Ensure file name provided if an action is requested
-    if (fileName == NULL){
-        fprintf(stderr, "Error: must provide archive file name.\n");
-        exit(NO_ARCHIVE_NAME);
-    }
     
-    // Ensure an action was provided
+    // Validate command arguments
     if (action == ACTION_NONE){ // If not, exit
         fprintf(stderr, "*** %s No action specified\n", argv[0]);
         exit(NO_ACTION_GIVEN);
     }
-    else{  // Otherwise open the archive file
-        fd = open(fileName, O_RDWR | O_CREAT, 0664);
-        if (fd == -1){
-            perror("Error opening archive file");
+    
+    if (file_name == NULL){
+        fprintf(stderr, "Error: must provide archive file name.\n");
+        exit(NO_ARCHIVE_NAME);
+    }
+
+    // Open or create archive file with read/write permissions
+    archive_fd = open(file_name, O_RDWR | O_CREAT, DEFAULT_MODE);
+    if (archive_fd == -1){
+        perror("Error opening archive file");
+        exit(CREATE_FAIL);
+    }
+    
+    if (action == ACTION_CREATE){
+        // Write the ARMAG macro to the file
+        if (write(archive_fd, ARMAG, SARMAG) != SARMAG){
+            perror("Error writing ARMAG");
+            close(archive_fd);
             exit(CREATE_FAIL);
         }
-        
-        if (action == ACTION_CREATE){
-            // Write the ARMAG macro to the file
-            if (write(fd, ARMAG, SARMAG) != SARMAG){
-                perror("Error writing ARMAG");
-                close(fd);
-                exit(CREATE_FAIL);
-            }
-            //Ensure correct permissions
-            if (fchmod(fd, 0664) == -1){
-                perror("Error setting file permissions");
-                close(fd);
-                exit(CREATE_FAIL);
-            }
-            //Process member file arguments
-            if (optind < argc){
-                for (int i = optind; i < argc; i++){
-                    // Open the member file
-                    member_fd = open(argv[i], O_RDONLY);
-                    if (member_fd == -1){
-                        perror("Error opening member file");
-                        close(fd);
-                        exit(CREATE_FAIL);
-                    }
-                    // Write the member file to the archive
-                    if (verboseFlag){
-                        printf("a - %s\n", argv[i]);
-                    }
-                    writeFileToArchive(fd, member_fd, determFlag, argv[i]);
+        // Ensure correct permissions
+        if (fchmod(archive_fd, DEFAULT_MODE) == -1){
+            perror("Error setting file permissions");
+            close(archive_fd);
+            exit(CREATE_FAIL);
+        }
+        // Process each file argument
+        if (optind < argc){
+            for (int i = optind; i < argc; i++){
+                // Open each member file and write to archive
+                member_fd = open(argv[i], O_RDONLY);
+                if (member_fd == -1){
+                    perror("Error opening member file");
+                    close(archive_fd);
+                    exit(CREATE_FAIL);
                 }
-            }
-
-        } else if (action == ACTION_EXTRACT || action == ACTION_TOC){
-            // Validate the ARMAG macro at the start of the archive file
-            if (read(fd, buffer, SARMAG) != SARMAG){
-                fprintf(stderr, "Error: Failed to read ARMAG from archive file.\n");
-                close(fd);
-                exit(BAD_TAG);
-            }
-
-            // Manually compare the buffer with ARMAG
-            isValid = 1;  // Assume the file is valid initially
-            for (int i = 0; i < SARMAG; i++) {
-                if (buffer[i] != ARMAG[i]) {
-                    isValid = 0;  // File is invalid
-                    break;
+                if (verbose_mode){
+                    printf("a - %s\n", argv[i]);
                 }
-            }
-
-            if (!isValid) {
-                fprintf(stderr, "Error: Invalid archive file format.\n");
-                close(fd);
-                exit(BAD_TAG);
-            }
-
-            if (action == ACTION_TOC){
-                printTOC(fd, verboseFlag);
-            }
-
-            if (action == ACTION_EXTRACT){
-                extractArchive(fd, verboseFlag);            
+                write_to_archive(archive_fd, member_fd, determ_mode, argv[i]);
             }
         }
+    } 
+    else{
+        // Verify archive format by checking ARMAG signature
+        if (read(archive_fd, buffer, SARMAG) != SARMAG){
+            fprintf(stderr, "Error: Failed to read ARMAG from archive file.\n");
+            close(archive_fd);
+            exit(BAD_TAG);
+        }
+
+        if (memcmp(buffer, ARMAG, SARMAG) != 0){
+            fprintf(stderr, "Error: Invalid archive file format.\n");
+            close(archive_fd);
+            exit(BAD_TAG);
+        }
+
+        // Execute requested action
+        if (action == ACTION_TOC){
+            print_toc(archive_fd, verbose_mode);
+        }
+
+        if (action == ACTION_EXTRACT){
+            extract_archive(archive_fd, verbose_mode);            
+        }
     }
-    close(fd);
+    close(archive_fd);
     return EXIT_SUCCESS;
 }
 
-void showHelp(void){
+// Display usage information and available options
+void show_help(void){
     printf("Usage: arvik -[cxtvDUf:h] archive-file file...\n"
            "\t-c           create a new archive file\n"
            "\t-x           extract members from an existing archive file\n"
@@ -182,286 +172,253 @@ void showHelp(void){
            "\t-h           show help text\n");
 }
 
-void printTOC(int iarch, int verboseFlag){
-    ar_hdr_t md;
-    char buffer[BUF_SIZE] = {'\0'};
-    char dateBuf[20];
-    char permissions[10];
-    char* back_pos = NULL;
-    mode_t mode;
-    time_t mtime;
-    struct tm *timeinfo;
-    off_t fileSize;
+// Display archive contents with optional verbose information
+void print_toc(int archive_fd, int verbose_mode){
+    ar_hdr_t archive_md;    // Archive header structure
+    char buffer[BUF_SIZE];  // General purpose buffer
+    char date_buffer[20];   // Buffer for formatted date string
+    char permissions[10];   // Buffer for permission string
+    char* back_pos = NULL;  // Position of '/' in filename
+    mode_t mode;            // File permissions
+    time_t mtime;           // File modification time
+    struct tm* time_info;   // Structured time information
+    off_t file_size;        // Size of current file
 
-    while (read(iarch, &md, sizeof(ar_hdr_t)) == sizeof(ar_hdr_t)){
-        memset(buffer, 0, sizeof(buffer));
-        strncpy(buffer, md.ar_name, sizeof(md.ar_name) - 1);
-        buffer[sizeof(md.ar_name) - 1] = '\0';
+    // Process each archive entry
+    while (read(archive_fd, &archive_md, sizeof(ar_hdr_t)) == sizeof(ar_hdr_t)){
+        // Clean up filename by removing trailing '/'
+        strncpy(buffer, archive_md.ar_name, sizeof(archive_md.ar_name) - 1);
+        buffer[sizeof(archive_md.ar_name) - 1] = '\0';
 
         if ((back_pos = strchr(buffer, '/')) != NULL){
             *back_pos = '\0';
         }
 
-        if (verboseFlag){ 
-            mode = (mode_t) strtol(md.ar_mode, NULL, 8);
-            getPermString(mode, permissions);
+        if (verbose_mode){ 
+            // Format and display detailed metadata 
+            mode = (mode_t) strtol(archive_md.ar_mode, NULL, 8);
+            memset(permissions, 0, sizeof(permissions));
+            get_perm_string(mode, permissions);
 
-            mtime = strtol(md.ar_date, NULL, 10);
-            timeinfo = localtime(&mtime);
-            strftime(dateBuf, sizeof(dateBuf), "%b %e %R %Y", timeinfo);
+            mtime = strtol(archive_md.ar_date, NULL, 10);
+            time_info = localtime(&mtime);
+            memset(date_buffer, 0, sizeof(date_buffer));
+            strftime(date_buffer, sizeof(date_buffer), "%b %e %R %Y", time_info);
 
             printf("%s %ld/%ld %ld %s %s\n", permissions,
-                   strtol(md.ar_uid, NULL, 10),
-                   strtol(md.ar_gid, NULL, 10),
-                   strtol(md.ar_size, NULL, 10),
-                   dateBuf, buffer);
+                   strtol(archive_md.ar_uid, NULL, 10),
+                   strtol(archive_md.ar_gid, NULL, 10),
+                   strtol(archive_md.ar_size, NULL, 10),
+                   date_buffer, buffer);
         }
         else{
             printf("%s\n", buffer);
         }
 
-        fileSize = strtol(md.ar_size, NULL, 10);
-        lseek(iarch, fileSize, SEEK_CUR);
+        // Skip to next entry, accounting for padding
+        file_size = strtol(archive_md.ar_size, NULL, 10);
+        if (lseek(archive_fd, file_size, SEEK_CUR) == -1){
+            perror("Error seeking in archive");
+            exit(TOC_FAIL);
+        }
 
-        if (fileSize % 2 != 0){
-            lseek(iarch, 1, SEEK_CUR);
+        if (file_size % 2 != 0){
+            if (lseek(archive_fd, 1, SEEK_CUR) == -1){
+                perror("Error seeking in archive");
+                exit(TOC_FAIL);
+            }
         }
     }
 }
 
-void getPermString(mode_t mode, char* permissions){
+// Convert file mode bits to string representation
+void get_perm_string(mode_t mode, char* permissions){
     // Set user permissions
-    if ((mode & S_IRUSR) != 0){
-        permissions[0] = 'r';
-    }
-    else{
-        permissions[0] = '-';
-    }
-
-    if ((mode & S_IWUSR) != 0){
-        permissions[1] = 'w';
-    }
-    else{
-        permissions[1] = '-';
-    }
-
-    if ((mode & S_IXUSR) != 0){
-        permissions[2] = 'x';
-    }
-    else{
-        permissions[2] = '-';
-    }
+    permissions[0] = (mode & S_IRUSR) ? 'r' : '-';
+    permissions[1] = (mode & S_IWUSR) ? 'w' : '-';
+    permissions[2] = (mode & S_IXUSR) ? 'x' : '-';
 
     // Set group permissions
-    if ((mode & S_IRGRP) != 0){
-        permissions[3] = 'r';
-    }
-    else{
-        permissions[3] = '-';
-    }
+    permissions[3] = (mode & S_IRGRP) ? 'r' : '-';
+    permissions[4] = (mode & S_IWGRP) ? 'w' : '-';
+    permissions[5] = (mode & S_IXGRP) ? 'x' : '-';
 
-    if ((mode & S_IWGRP) != 0){
-        permissions[4] = 'w';
-    }
-    else{
-        permissions[4] = '-';
-    }
-
-    if ((mode & S_IXGRP) != 0){
-        permissions[5] = 'x';
-    }
-    else{
-        permissions[5] = '-';
-    }
-
-    // Set other (world) permissions
-    if ((mode & S_IROTH) != 0){
-        permissions[6] = 'r';
-    }
-    else{
-        permissions[6] = '-';
-    }
-
-    if ((mode & S_IWOTH) != 0){
-        permissions[7] = 'w';
-    }
-    else{
-        permissions[7] = '-';
-    }
-
-    if ((mode & S_IXOTH) != 0){
-        permissions[8] = 'x';
-    }
-    else{
-        permissions[8] = '-';
-    }
+    // Set other permissions
+    permissions[6] = (mode & S_IROTH) ? 'r' : '-';
+    permissions[7] = (mode & S_IWOTH) ? 'w' : '-';
+    permissions[8] = (mode & S_IXOTH) ? 'x' : '-';
 
     // Null terminate the string
     permissions[9] = '\0';
 }
 
-void writeFileToArchive(int iarch, int member_fd, int determFlag, const char* fileName){
-    stat_t fileMetaData;
-    ar_hdr_t md;
-    ssize_t bytesRead;
-    ssize_t bytesWritten;
-    size_t nameLen;
-    char dateBuf[13];
-    char uidBuf[7];
-    char gidBuf[7];
-    char modeBuf[9];
-    char sizeBuf[11];
-    char buffer[BUF_SIZE]; // Buffer for reading incoming file data
+// Write a file to the archive with metadata
+void write_to_archive(int archive_fd, int member_fd, int determ_mode, const char* file_name){
+    stat_t file_md;         // File metadata
+    ar_hdr_t archive_md;    // Archive header
+    ssize_t bytes_read;     // Bytes read from member file
+    ssize_t bytes_written;  // Bytes written to archive
+    size_t name_len;        // Length of filename
+    char date_buffer[13];   // Buffer for formatted date
+    char uid_buffer[7];     // Buffer for user ID
+    char gid_buffer[7];     // Buffer for group ID
+    char mode_buffer[9];    // Buffer for file mode
+    char size_buffer[11];   // Buffer for file size
+    char buffer[BUF_SIZE];  // General purpose buffer
 
     // Get file metadata
-    if (fstat(member_fd, &fileMetaData) == -1){
-        perror("Error getting file metadata");
+    if (fstat(member_fd, &file_md) == -1){
+        perror("Error getting file archive_md");
         exit(CREATE_FAIL);
     }
 
-    if (determFlag == ON){
-        fileMetaData.st_mtime = 0;
-        fileMetaData.st_uid = 0;
-        fileMetaData.st_gid = 0;
-        fileMetaData.st_mode = 0644;
+    // Apply deterministic mode settings if enabled
+    if (determ_mode == ON){
+        file_md.st_mtime = 0;
+        file_md.st_uid = 0;
+        file_md.st_gid = 0;
+        file_md.st_mode = DETERMINISTIC_MODE;
     }
     
-    // Fill the header struct with file metadata
 
-    // File name (16 bytes)
-    strncpy(md.ar_name, fileName, sizeof(md.ar_name) - 1);
-    md.ar_name[sizeof(md.ar_name) - 1] = '\0'; // Ensure null termination
-    nameLen = strlen(md.ar_name);
+    // Format file name with trailing '/' and padding
+    strncpy(archive_md.ar_name, file_name, sizeof(archive_md.ar_name) - 1);
+    archive_md.ar_name[sizeof(archive_md.ar_name) - 1] = '\0'; // Ensure null termination
+    name_len = strlen(archive_md.ar_name);
 
-    //Append '/' and pad with spaces
-    if (nameLen < sizeof(md.ar_name) - 1){
-        md.ar_name[nameLen] = '/'; // Append '/'
-        memset(md.ar_name + nameLen + 1, ' ', sizeof(md.ar_name) - nameLen - 1);
+    if (name_len < sizeof(archive_md.ar_name) - 1){
+        archive_md.ar_name[name_len] = '/'; // Append '/'
+        memset(archive_md.ar_name + name_len + 1, ' ', sizeof(archive_md.ar_name) - name_len - 1);
     }
     else{
-        md.ar_name[sizeof(md.ar_name) - 2] = '/';
-        md.ar_name[sizeof(md.ar_name) - 1] = ' ';
+        archive_md.ar_name[sizeof(archive_md.ar_name) - 2] = '/';
+        archive_md.ar_name[sizeof(archive_md.ar_name) - 1] = ' ';
     }
 
-    // Time info (12 bytes)
-    sprintf(dateBuf, "%-12ld", (long) fileMetaData.st_mtime);
-    memcpy(md.ar_date, dateBuf, sizeof(md.ar_date));
+    // Format metadata fields for header
+    sprintf(date_buffer, "%-12ld", (long) file_md.st_mtime);
+    memcpy(archive_md.ar_date, date_buffer, sizeof(archive_md.ar_date));
            
-    // User ID (6 bytes)
-    sprintf(uidBuf, "%-6d", fileMetaData.st_uid);
-    memcpy(md.ar_uid, uidBuf, sizeof(md.ar_uid));
+    sprintf(uid_buffer, "%-6d", file_md.st_uid);
+    memcpy(archive_md.ar_uid, uid_buffer, sizeof(archive_md.ar_uid));
 
-    // Group ID (6 bytes)
-    sprintf(gidBuf, "%-6d", fileMetaData.st_gid);
-    memcpy(md.ar_gid, gidBuf, sizeof(md.ar_gid));
+    sprintf(gid_buffer, "%-6d", file_md.st_gid);
+    memcpy(archive_md.ar_gid, gid_buffer, sizeof(archive_md.ar_gid));
 
-    //File mode (8 bytes)
-    sprintf(modeBuf, "%-8o", fileMetaData.st_mode);
-    memcpy(md.ar_mode, modeBuf, sizeof(md.ar_mode));
+    sprintf(mode_buffer, "%-8o", file_md.st_mode);
+    memcpy(archive_md.ar_mode, mode_buffer, sizeof(archive_md.ar_mode));
 
-    //File size (10 bytes)
-    sprintf(sizeBuf, "%-10ld", (long) fileMetaData.st_size);
-    memcpy(md.ar_size, sizeBuf, sizeof(md.ar_size));
+    sprintf(size_buffer, "%-10ld", (long) file_md.st_size);
+    memcpy(archive_md.ar_size, size_buffer, sizeof(archive_md.ar_size));
 
-    //Magic number (2 bytes)
-    memcpy(md.ar_fmag, ARFMAG, sizeof(md.ar_fmag));
+    memcpy(archive_md.ar_fmag, ARFMAG, sizeof(archive_md.ar_fmag));
 
-    // Write the header to the archive
-    bytesWritten = write(iarch, &md, sizeof(ar_hdr_t));
-    if (bytesWritten != sizeof(md)) {
+    // Write header to archive
+    bytes_written = write(archive_fd, &archive_md, sizeof(ar_hdr_t));
+    if (bytes_written != sizeof(archive_md)){
         perror("Error writing file header to archive");
         exit(CREATE_FAIL);
     }
 
-    // Write the file data to the archive
-    while ((bytesRead = read(member_fd, buffer, sizeof(buffer))) > 0) {
-        bytesWritten = write(iarch, buffer, bytesRead);
-        if (bytesWritten != bytesRead) {
+    // Copy file contents to archive
+    while ((bytes_read = read(member_fd, buffer, sizeof(buffer))) > 0){
+        bytes_written = write(archive_fd, buffer, bytes_read);
+        if (bytes_written != bytes_read){
             perror("Error writing file data to archive");
             exit(CREATE_FAIL);
         }
     }
 
-    // Pad the file data to ensure 2-byte alignment
-    if (fileMetaData.st_size % 2 != 0) {
+    // Add padding byte if needed 
+    if (file_md.st_size % 2 != 0){
         char pad = '\n';
-        if (write(iarch, &pad, 1) != 1) {
+        if (write(archive_fd, &pad, 1) != 1){
             perror("Error padding file data");
             exit(CREATE_FAIL);
         }
     }
 }
 
-void extractArchive(int iarch, int verboseFlag){
-    ar_hdr_t md;
-    char* back_pos;
-    int output_fd;
-    char buffer[BUF_SIZE];
-    ssize_t bytesRead;
-    ssize_t bytesWritten;
-    off_t fileSize;
-    mode_t fileMode;
-    struct timespec times[2];
+// Extract files from archive while preserving metadata
+void extract_archive(int archive_fd, int verbose_mode){
+    ar_hdr_t archive_md;        // Archive header
+    char* back_pos;             // Position of '/' in filename
+    int output_fd;              // Output file descriptor
+    char buffer[BUF_SIZE];      // General purpose buffer
+    ssize_t bytes_read;         // Bytes read from archive
+    ssize_t bytes_written;      // Bytes written to output
+    off_t file_size;            // Size of current file
+    mode_t fileMode;            // File permissions
+    struct timespec times[2];   // File timestamps
 
-    while (read(iarch, &md, sizeof(ar_hdr_t)) > 0){
-        char fileName[sizeof(md.ar_name) + 1];
-        strncpy(fileName, md.ar_name, sizeof(fileName));
-        fileName[sizeof(md.ar_name)] = '\0';
-        back_pos = strchr(fileName, '/');
+    // Process each file in archive
+    while (read(archive_fd, &archive_md, sizeof(ar_hdr_t)) > 0){
+        // Extract and clean up filename (remove trailing '/')
+        char file_name[sizeof(archive_md.ar_name) + 1];
+        strncpy(file_name, archive_md.ar_name, sizeof(file_name) - 1);
+        back_pos = strchr(file_name, '/');
         if (back_pos != NULL){
             *back_pos = '\0';
         }
 
-        output_fd = open(fileName, O_WRONLY | O_CREAT | O_TRUNC, 0664);
+        // Create new file for output with default permissions
+        output_fd = open(file_name, O_WRONLY | O_CREAT | O_TRUNC, DEFAULT_MODE);
         if (output_fd == -1){
             perror("Error opening output file");
-            close(iarch);
+            close(output_fd);
+            close(archive_fd);
             exit(EXTRACT_FAIL);
         }
 
-        fileSize = atol(md.ar_size);
-        while (fileSize > 0){
-            bytesRead = read(iarch, buffer, MIN(sizeof(buffer), (size_t)fileSize));
-            if (bytesRead <= 0){
+        // Copy file contents to output file
+        file_size = strtol(archive_md.ar_size, NULL, 10);
+        while (file_size > 0){
+            bytes_read = read(archive_fd, buffer, MIN(sizeof(buffer), (size_t)file_size));
+            if (bytes_read <= 0){
                 perror("Error reading archive data");
                 close(output_fd);
-                close(iarch);
+                close(archive_fd);
                 exit(EXTRACT_FAIL);
             }
-            bytesWritten = write(output_fd, buffer, bytesRead);
-            if (bytesWritten != bytesRead){
+            bytes_written = write(output_fd, buffer, bytes_read);
+            if (bytes_written != bytes_read){
                 perror("Error writing output file");
                 close(output_fd);
-                close(iarch);
+                close(archive_fd);
                 exit(EXTRACT_FAIL);
             }
-            fileSize -= bytesRead;
+            file_size -= bytes_read;
         }
 
-        fileMode = strtol(md.ar_mode, NULL, 8);
-
+        // Restore original file permissions
+        fileMode = strtol(archive_md.ar_mode, NULL, 8);
         if (fchmod(output_fd, fileMode) == 1){
             perror("Error setting file permissions");
             close(output_fd);
-            close(iarch);
+            close(archive_fd);
             exit(EXTRACT_FAIL);
         }
 
-        times[0].tv_sec = strtol(md.ar_date, NULL, 10);
-        times[1].tv_sec = strtol(md.ar_date, NULL, 10);
+        // Restore original timestamps
+        times[0].tv_sec = strtol(archive_md.ar_date, NULL, 10);
+        times[1].tv_sec = strtol(archive_md.ar_date, NULL, 10);
         if (futimens(output_fd, times) == -1){
             perror("Error setting file timestamps");
             close(output_fd);
-            close(iarch);
+            close(archive_fd);
             exit(EXTRACT_FAIL);
         }
 
-        if (verboseFlag){
-            printf("x - %s\n", fileName);
+        // Print extraction status if verbose mode is on
+        if (verbose_mode){
+            printf("x - %s\n", file_name);
         }
 
-        if (atoi(md.ar_size) % 2 != 0){
-            lseek(iarch, 1, SEEK_CUR);
+        close(output_fd);
+
+        // Skip padding byte if file size is odd
+        if (strtol(archive_md.ar_size, NULL, 10) % 2 != 0){
+            lseek(archive_fd, 1, SEEK_CUR);
         }
     }
 }
